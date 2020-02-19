@@ -1,5 +1,4 @@
-CC=gcc
-CFLAGS=-Wall -Werror -Wextra -std=c11 -O2 -fomit-frame-pointer -march=native
+CFLAGS=-Wall -Werror -Wextra -std=c11 -O2 -fomit-frame-pointer
 
 .PHONY: all
 all: mai
