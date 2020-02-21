@@ -103,7 +103,8 @@ static uint64_t ptp_stamp(uint8_t *in) {
 /* ######################################################################## */
 static uint64_t ptp_timespec_to_ts(const struct timespec *ts) {
 #define NS_PER_SEC 1000000000ULL
-	return (uint64_t)ts->tv_sec * NS_PER_SEC + (uint64_t)ts->tv_nsec;
+	// return (uint64_t)ts->tv_sec * NS_PER_SEC + (uint64_t)ts->tv_nsec;
+	return((ts->tv_sec * ptp_rate) + ((ts->tv_nsec * ptp_rate) / 1000000000));
 }
 
 /* ######################################################################## */
@@ -121,8 +122,8 @@ static void ptp_update(int index, uint64_t value) {
 static void ptp_adjust(void)
 {
 	int64_t t1 = (int64_t)stamps[T1];
-	int64_t t2 = (int64_t)stamps[T2] - offset;
-	int64_t t3 = (int64_t)stamps[T3] - offset;
+	int64_t t2 = (int64_t)stamps[T2] + offset;
+	int64_t t3 = (int64_t)stamps[T3] + offset;
 	int64_t t4 = (int64_t)stamps[T4];
 
 	int64_t error = -((t2 - t1) - (t4 - t3)) / 2;
