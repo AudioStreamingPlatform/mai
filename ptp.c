@@ -9,7 +9,7 @@
 #include <linux/sockios.h>
 
 /* ######################################################################## */
-struct packet {
+struct ptp_header {
         uint8_t         type;
         uint8_t         version;
         uint16_t        length;
@@ -24,6 +24,42 @@ struct packet {
         uint8_t         interval;
         uint8_t		payload[];
 } __attribute__((__packed__));
+
+struct ptp_timestamp {
+	uint16_t	seconds_msb;
+	uint32_t	seconds_lsb;
+	uint32_t	nanoseconds;
+} __attribute__((__packed__));
+
+struct ptp_sync_msg {
+	struct ptp_header	header;
+	struct ptp_timestamp	timestamp;
+} __attribute__((__packed__));
+
+struct ptp_delay_req_msg {
+	struct ptp_header	header;
+	struct ptp_timestamp	timestamp;
+	uint8_t 		suffix[];
+} __attribute__((__packed__));
+
+enum message_type {
+	PTP_MSG_SYNC			= 0x0,
+	PTP_MSG_DELAY_REQ		= 0x1,
+	PTP_MSG_PDELAY_REQ		= 0x2,
+	PTP_MSG_PDELAY_RESP		= 0x3,
+	PTP_MSG_FOLLOW_UP		= 0x8,
+	PTP_MSG_DELAY_RESP		= 0x9,
+	PTP_MSG_PDELAY_RESP_FOLLOW_UP	= 0xA,
+	PTP_MSG_ANNOUNCE		= 0xB,
+	PTP_MSG_SIGNALING		= 0xC,
+	PTP_MSG_MANAGEMENT		= 0xD,
+};
+
+enum ptp_ts_type {
+	PTP_TS_NONE,
+	PTP_TS_HARDWARE,
+	PTP_TS_SOFTWARE
+};
 
 /* ######################################################################## */
 static char		ptp_source[32];		// PTP master source (decoded/text)
@@ -41,6 +77,14 @@ static int		req_sock  = -1;		// socket for sending messages
 static uint16_t 	req_seq   = 0;		// request message sequence
 static uint64_t		req_sent  = 0;		// PTP DELAY Sender   Timestamp (T2)
 static uint64_t		req_sync  = 0;		// PTP DELAY Receiver Timestamp (T'2)
+
+static uint64_t         stamps[4];
+static int64_t		offset = 0;
+
+#define T1 0
+#define T2 1
+#define T3 2
+#define T4 3
 
 /* ######################################################################## */
 static uint64_t ptp_stamp(uint8_t *in) {
@@ -63,8 +107,30 @@ static uint64_t ptp_timespec_to_ts(const struct timespec *ts) {
 }
 
 /* ######################################################################## */
-enum ptp_ts_type { PTP_NO_TS, PTP_HARDWARE_TS, PTP_SOFTWARE_TS };
+static enum message_type ptp_msg_type(const struct ptp_header *packet) {
+	return (enum message_type)packet->type & 0xf;
+}
 
+/* ######################################################################## */
+static void ptp_update(int index, uint64_t value) {
+	mai_debug("T%d: %lu -> %lu\n", index + 1, stamps[index], value);
+	stamps[index] = value;
+}
+
+/* ######################################################################## */
+static void ptp_adjust(void)
+{
+	int64_t t1 = (int64_t)stamps[T1];
+	int64_t t2 = (int64_t)stamps[T2] - offset;
+	int64_t t3 = (int64_t)stamps[T3] - offset;
+	int64_t t4 = (int64_t)stamps[T4];
+
+	int64_t error = -((t2 - t1) - (t4 - t3)) / 2;
+	mai_debug("offset: %ld, error: %ld\n", offset, error);
+	offset += error;
+}
+
+/* ######################################################################## */
 static enum ptp_ts_type ptp_get_ts(struct msghdr *msg, uint64_t *ts)
 {
 	struct timespec *sw = NULL;
@@ -94,18 +160,18 @@ static enum ptp_ts_type ptp_get_ts(struct msghdr *msg, uint64_t *ts)
 	}
 
 	if (hw) {
-		mai_debug("hw: [%luns, %luns, %luns]\n",
-			  ptp_timespec_to_ts(&hw[0]),
-			  ptp_timespec_to_ts(&hw[1]),
-			  ptp_timespec_to_ts(&hw[2]));
+		// mai_debug("hw: [%luns, %luns, %luns]\n",
+		// 	  ptp_timespec_to_ts(&hw[0]),
+		// 	  ptp_timespec_to_ts(&hw[1]),
+		// 	  ptp_timespec_to_ts(&hw[2]));
 		*ts = ptp_timespec_to_ts(&hw[2]);
-		return PTP_HARDWARE_TS;
+		return PTP_TS_HARDWARE;
 	} else if (sw) {
 		*ts = ptp_timespec_to_ts(sw);
-		mai_debug("sw: %luns\n", *ts);
-		return PTP_SOFTWARE_TS;
+		// mai_debug("sw: %luns\n", *ts);
+		return PTP_TS_SOFTWARE;
 	} else {
-		return PTP_NO_TS;
+		return PTP_TS_NONE;
 	}
 }
 
@@ -149,24 +215,24 @@ static int ptp_sendmsg(int fd, void *buf, size_t len, uint64_t *ts) {
 
 	// TODO(tejo): Just return `ts_type` (requires changes to caller)
 	enum ptp_ts_type ts_type = ptp_get_ts(&msg, ts);
-	return (ts_type == PTP_NO_TS) ? 0 : res;
+	return (ts_type == PTP_TS_NONE) ? 0 : res;
 }
 
 /* ######################################################################## */
-static void ptp_update(void) {
+static void ptp_req_delay(void) {
 	// send delay requests only in sender mode and only every 2 seconds
 	if (!MAI_SENDER || (req_sync > ptp_sync) || ((ptp_sync - req_sync) < (ptp_rate * 2)))
 		return;
 	
 	// expected size of DELAY REQUEST packet (header + 48bits + 32bits)
-	static const size_t pktlen = sizeof(struct packet) + ((48 + 32) / 8);
+	static const size_t pktlen = sizeof(struct ptp_header) + ((48 + 32) / 8);
 	
-	struct packet *packet = alloca(pktlen);
+	struct ptp_header *packet = alloca(pktlen);
 	memset(packet, 0, pktlen);
 	
 	mai_sock_if_local(packet->source);	// PTP: Local Source
 	
-	packet->type     = 1;			// PTP: DELAY REQUEST
+	packet->type     = PTP_MSG_DELAY_REQ;	// PTP: DELAY REQUEST
 	packet->version  = 2;			// PTP: VERSION 2
 	packet->length   = pktlen;		// PTP: Header + Body Length
 	packet->sequence = ++req_seq;		// PTP: Expected Response Sequence
@@ -176,7 +242,8 @@ static void ptp_update(void) {
 		mai_error("send: %m\n");
 		
 	req_sent = mai_rtp_clock();		// set delay request time (T2)
-	mai_debug("pck_sent: %lu, req_sent: %lu\n", pck_sent, req_sent);
+	//mai_debug("pck_sent: %lu, req_sent: %lu\n", pck_sent, req_sent);
+	ptp_update(T3, pck_sent);
 	MAI_STAT_INC(ptp.requests);
 }
 
@@ -200,49 +267,55 @@ static int ptp_recvmsg(int fd, void *buf, size_t len, uint64_t *ts)
 
 	// TODO(tejo): Just return `ts_type` (requires changes to caller)
 	enum ptp_ts_type ts_type = ptp_get_ts(&msg, ts);
-	return (ts_type == PTP_NO_TS) ? 0 : cnt;
+	return (ts_type == PTP_TS_NONE) ? 0 : cnt;
 }
 
 /* ######################################################################## */
 static void *ptp_general(void *arg) {
 	// packet data buffer and header overlay
-	uint8_t	type, data[2048];
+	uint8_t	data[2048];
 
 	// state data
-	struct packet *packet = (struct packet *)data;
-	
+	struct ptp_header *packet = (struct ptp_header *)data;
+
 	for (ssize_t r; 1; ) {
 		uint64_t pck_recv;
 		if ((r = ptp_recvmsg(gen_sock, data, sizeof(data), &pck_recv)) <= 0)
 			mai_error("recv: %m\n");
-			
+
 		if (((packet->version & 0x0F) != 2) || (packet->domain != 0))
 			continue;				// skip: PTP VERSION != 2 or PTP DOMAIN != 0
-			
+
 		MAI_STAT_INC(ptp.general);
-			
-		type = packet->type & 0x0F;
-		
-		if (type == 0x08) { 				// is this the second phase of a two-phase clock?
+
+		switch (ptp_msg_type(packet)) {
+		case PTP_MSG_FOLLOW_UP:
 			if (packet->sequence != clk_seq)	// is this the right sequence?
 				continue;
-				
+
 			ptp_recv = clk_recv;			// set received time (T'1)
 			ptp_sync = ptp_stamp(packet->payload);	// set master time   (T1)
-			mai_debug("pck_recv: %lu, ptp_recv: %lu, ptp_sync: %lu\n", pck_recv, ptp_recv, ptp_sync);
-			ptp_update();
-			
-		} else if (type == 0x09) { 			// is this a delay response message?
+			//mai_debug("pck_recv: %lu, ptp_recv: %lu, ptp_sync: %lu\n", pck_recv, ptp_recv, ptp_sync);
+
+			ptp_update(T1, ptp_stamp(packet->payload));
+			ptp_req_delay();
+			break;
+		case PTP_MSG_DELAY_RESP:
 			if (packet->sequence != req_seq)	// is this the right sequence?
 				continue;
-				
-			req_sync = ptp_stamp(packet->payload);	// set master delay (T'2)
 
+			req_sync = ptp_stamp(packet->payload);	// set master delay (T'2)
 			int64_t offset = ((int64_t)ptp_recv - (int64_t)ptp_sync - (int64_t)req_sync + (int64_t)req_sent) / 2;
-			mai_debug("pck_recv: %luns, req_sync: %luns, offset = %ldns\n", pck_recv, req_sync, offset);
+			//mai_debug("pck_recv: %luns, req_sync: %luns, offset = %ldns\n", pck_recv, req_sync, offset);
 
 			// send calculated PTP offset to RTP system
 			mai_rtp_offset(offset);
+
+			ptp_update(T4, ptp_stamp(packet->payload));
+			ptp_adjust();
+			break;
+		default:
+			continue;
 		}
 	}
 
@@ -258,7 +331,7 @@ static void *ptp_event(void *arg) {
 	uint8_t	data[2048];
 
 	// state data
-	struct packet 	    *packet = (struct packet *)data;
+	struct ptp_header 	    *packet = (struct ptp_header *)data;
 	static const size_t  pktlen = sizeof(*packet) + ((48 + 32) / 8);
 	
 	uint8_t source[sizeof(packet->source)];		// current PTP SYNC source
@@ -277,10 +350,10 @@ static void *ptp_event(void *arg) {
 			
 		if (((size_t)r < pktlen) || (ntohs(packet->length) < pktlen))
 			continue;	// skip: PTP LENGTH < (sizeof(header) + sizeof(SYNC))
-			
-		if ((packet->type & 0x0F) != 0)
-			continue;	// skip: PTP TYPE != SYNC
-			
+
+		if (ptp_msg_type(packet) != PTP_MSG_SYNC)
+			continue;
+
 		// check synchronization source
 		if (memcmp(source, packet->source, sizeof(source))) {
 			// we just got a SYNC from a different clock, start RESYNC
@@ -304,12 +377,15 @@ static void *ptp_event(void *arg) {
 		if (packet->flags & flag_two_step) {	// is this a two-phase clock?
 			clk_seq  = packet->sequence;	// save sequence
 			clk_recv = mai_rtp_clock();	// save received time
-			mai_debug("pck_recv: %lu, clk_recv: %lu, clk_seq: %u\n", pck_recv, clk_recv, clk_seq);
+			ptp_update(T2, pck_recv);
+			//mai_debug("pck_recv: %lu, clk_recv: %lu, clk_seq: %u\n", pck_recv, clk_recv, clk_seq);
 		} else {				// otherwise, it's a single phase clock
 			ptp_recv = mai_rtp_clock();	// set received time
 			ptp_sync = stamp;		// set master time
-			mai_debug("pck_recv: %lu, ptp_recv: %lu, ptp_sync: %lu\n", pck_recv, ptp_recv, ptp_sync);
-			ptp_update();
+			//mai_debug("pck_recv: %lu, ptp_recv: %lu, ptp_sync: %lu\n", pck_recv, ptp_recv, ptp_sync);
+			ptp_update(T1, stamp);
+			ptp_update(T2, pck_recv);
+			ptp_req_delay();
 		}
 	}
 	
